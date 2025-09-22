@@ -1,6 +1,7 @@
 name: RDP
 on:
   workflow_dispatch:
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -8,6 +9,7 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -17,38 +19,45 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Remove any existing firewall rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
 
-          # For testing, allow any incoming connection on port 3389
+          # Allow incoming connections on port 3389 for testing
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
              dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User with Fixed Password
+        shell: powershell
         run: |
-          # Use an easy fixed password as requested
-          $password = '123123123'
+          # الثابت الذي طلبته (يلبي متطلبات التعقيد والطول)
+          $password = 'Yahia@2yahiA112'
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # If user exists, update its password; otherwise create it
+          # إذا كان المستخدم موجودًا نحدّث كلمة المرور، وإلا ننشئه
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               try {
                   Set-LocalUser -Name "RDP" -Password $securePass -ErrorAction Stop
               } catch {
-                  Write-Host "Unable to set password for existing user 'RDP'."
+                  Write-Host "Unable to set password for existing user 'RDP': $_"
+                  exit 1
               }
           } else {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              try {
+                  New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              } catch {
+                  Write-Host "Failed to create user 'RDP': $_"
+                  exit 1
+              }
           }
 
-          # Ensure membership in required groups (ignore errors if already member)
+          # تأكد من العضويات المطلوبة (تجاهل إذا كان موجودًا)
           try { Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue } catch {}
           try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue } catch {}
 
-          # Export credentials to environment for later steps
+          # احفظ الاعتماديات لخطوات لاحقة (ملاحظة: سيبقى النص واضحاً في env إذا لم تستخدم secrets)
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $password"
 
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
@@ -57,6 +66,7 @@ jobs:
           }
 
       - name: Install Tailscale
+        shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
@@ -65,16 +75,20 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          # Wait for Tailscale to assign an IP
+          # Wait for Tailscale to assign an IPv4 address
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) -join ''
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 3
               $retries++
           }
 
@@ -82,24 +96,29 @@ jobs:
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
+
+          # Export the Tailscale IP for later steps
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
 
       - name: Verify RDP Accessibility
+        shell: powershell
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "TCP connectivity to RDP port 3389 successful!"
 
       - name: Maintain Connection
+        shell: powershell
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
+          # عرض الاعتماديات المخزنة في GITHUB_ENV
           Write-Host "Password: $(Get-Content $env:GITHUB_ENV | Select-String 'RDP_CREDS' -SimpleMatch)"
           Write-Host "==================`n"
 
